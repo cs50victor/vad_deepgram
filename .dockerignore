@@ -1,0 +1,5 @@
+*
+!src/
+!Cargo.toml
+!mkbhd_video.mp3
+!rust-toolchain.toml

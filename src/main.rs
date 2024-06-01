@@ -1,25 +1,31 @@
 // derived from https://github.com/deepgram-devs/deepgram-rust-sdk/pull/22
-use std::{sync::Arc, time::Duration};
+#![feature(array_chunks)]
+use std::{sync::Arc, time::{Duration, Instant}};
 
 use async_trait::async_trait;
+use bytes::Buf as _;
 use deepgram::DeepgramError;
 use ezsockets::{
     client::ClientCloseMode, Client, ClientConfig, CloseFrame, MessageStatus, RawMessage,
     SocketConfig, WSError,
 };
-use log::{error, info};
-use rand::Rng;
+use futures::{stream, StreamExt};
+use samplerate::{ConverterType, Samplerate};
+use tokio::time::sleep;
+use tracing::{debug, error, info, warn};
 use serde_json::{json, Value};
+use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
+use voice_activity_detector::VoiceActivityDetector;
 
 static PATH_TO_FILE: &str = "mkbhd_video.mp3";
 
 #[derive(Clone)]
 pub struct STT {
-    ws_client: Arc<Client<WSClient>>,
+    ws_client: Client<WSClient>,
 }
 
 struct WSClient {
-    llm_channel_tx: crossbeam_channel::Sender<String>,
+    buffer: Vec<String>
 }
 
 #[async_trait]
@@ -30,11 +36,22 @@ impl ezsockets::ClientExt for WSClient {
         let data: Value = serde_json::from_str(&text)?;
         let transcript = data["channel"]["alternatives"][0]["transcript"].clone();
 
-        if transcript != Value::Null {
-            if let Err(e) = self.llm_channel_tx.send(transcript.to_string()) {
-                error!("Error sending to LLM: {}", e);
+        let transcript_is_final = data["is_final"] == Value::Bool(true);
+
+        if let Value::String(transcript) = transcript {
+            match self.buffer.len(){
+                0 => self.buffer.push(transcript),
+                n => self.buffer[n-1] = transcript
             };
-        }
+            if transcript_is_final {
+                self.buffer.push("".into());
+            }
+        };
+        info!("current transcript -> {:?}", self.buffer);
+        // if user_is_not_talking {
+        //     let x = self.buffer.join(" ");
+        //     self.buffer.clear();
+        // }
 
         Ok(())
     }
@@ -74,7 +91,7 @@ impl ezsockets::ClientExt for WSClient {
 }
 
 impl STT {
-    pub async fn new(llm_channel_tx: crossbeam_channel::Sender<String>) -> anyhow::Result<Self> {
+    pub async fn new() -> anyhow::Result<Self> {
         let deepgram_api_key = std::env::var("DEEPGRAM_API_KEY").unwrap();
 
         let config = ClientConfig::new("wss://api.deepgram.com/v1/listen")
@@ -91,17 +108,21 @@ impl STT {
                     )
                 }),
             })
-            .header("Authorization", &format!("Token {}", deepgram_api_key))
-            .query_parameter("model", "nova-2-conversationalai")
+            .header("Authorization", &format!("Token {deepgram_api_key}"))
+            .query_parameter("model", "nova-2-phonecall")
+            .query_parameter("interim_results", "true")
             .query_parameter("smart_format", "true")
-            .query_parameter("version", "latest")
+            .query_parameter("endpointing", &550.to_string())
+            .query_parameter("utterance_end_ms", &1000.to_string())
             .query_parameter("filler_words", "true");
 
         let (ws_client, _) =
-            ezsockets::connect(|_client| WSClient { llm_channel_tx }, config).await;
+            ezsockets::connect(|_client| WSClient { 
+                buffer: Vec::new()
+             }, config).await;
 
         Ok(Self {
-            ws_client: Arc::new(ws_client),
+            ws_client,
         })
     }
     pub fn send(&self, bytes: impl Into<Vec<u8>>) -> anyhow::Result<MessageStatus> {
@@ -112,66 +133,129 @@ impl STT {
 
 #[tokio::main]
 async fn main() -> Result<(), DeepgramError> {
-    pretty_env_logger::formatted_builder()
-        .filter_module("deepgram_ws", log::LevelFilter::Info)
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "vad_deepgram=debug,ezsockets=debug".into()),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .compact()
+                .with_line_number(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .with_target(true)
+                .with_span_events(FmtSpan::CLOSE),
+        )
         .init();
 
-    let (llm_tx, llm_rx) = crossbeam_channel::unbounded::<String>();
-
-    let stt = STT::new(llm_tx).await.unwrap();
+    let stt = STT::new().await.unwrap();
     let stt = stt.clone();
 
     let send_task = tokio::spawn(send_to_deepgram(stt));
 
-    let deepgram_task = tokio::spawn(async move {
-        while let Ok(msg) = llm_rx.recv() {
-            info!("{msg}");
-        }
-    });
-
     send_task.await.unwrap()?;
-    deepgram_task.await.unwrap();
     info!("Done!");
     Ok(())
 }
 
 async fn send_to_deepgram(stt: STT) -> Result<(), DeepgramError> {
-    // simulate a user not speaking for the first couple of seconds
-    simulate_long_pause(15).await;
+    
+    let mut vad = VAD::new(480000, 1, 200).unwrap();
 
     let audio_data = tokio::fs::read(PATH_TO_FILE).await.unwrap();
 
-    static SLICE_SIZE: usize = 500;
+    const SLICE_SIZE: usize = 480;
+
+    let mut c = stream::iter(audio_data.chunks(SLICE_SIZE));
 
     // Simulate an audio stream by sending the contents of a file in chunks
-    let mut slice_begin = 0;
-    while slice_begin < audio_data.len() {
-        let slice_end = std::cmp::min(slice_begin + SLICE_SIZE, audio_data.len());
-
-        let slice = &audio_data[slice_begin..slice_end];
-
-        if let Err(e) = stt.send(slice) {
-            error!("Error sending to Deepgram: {}", e);
-        };
-
-        slice_begin += SLICE_SIZE;
-
-        // Randomly simulate a user not speaking for a few seconds
-        let pause = rand::thread_rng().gen_range(0..10000);
-        if pause%2==0 && pause < 14 {
-            simulate_long_pause(pause).await;
+    while let Some(slice) = c.next().await {
+        if vad.is_talking(slice) {
+            // info!("is talking!");
+            if let Err(e) = stt.send(slice) {
+                error!("Error sending to Deepgram: {}", e);
+            };
+        }else{
+            info!("not talking!");
         }
+        sleep(Duration::from_millis(200)).await;
     }
 
+    warn!("DONE");
+
     // Tell Deepgram that we've finished sending audio data by sending a zero-byte message
-    if let Err(e) = stt.send([]) {
-        error!("Error sending to Deepgram: {}", e);
-    };
+    // if let Err(e) = stt.send([]) {
+    //     error!("Error sending to Deepgram: {}", e);
+    // };
 
     Ok(())
 }
 
-async fn simulate_long_pause(pause: u64) {
-    info!("Simulating a pause of {} seconds", pause);
-    tokio::time::sleep(Duration::from_secs(pause)).await;
+
+#[allow(clippy::upper_case_acronyms)]
+struct VAD {
+    inner: VoiceActivityDetector,
+    sample_converter: Samplerate,
+    #[allow(dead_code)]
+    chunk_size: usize,
+    prev: bool,
+    delay: usize,
+    silence_clock: Instant
+}
+
+unsafe impl Send for VAD {}
+
+impl VAD {
+    pub fn new(src_sample_rate: u32, num_of_channels: usize, delay: usize) -> anyhow::Result<Self>{
+        let chunk_size = 512;
+        let inner = VoiceActivityDetector::builder()
+        .chunk_size(chunk_size)
+        .sample_rate(16000)
+        .build()?;
+        let sample_converter = Samplerate::new(ConverterType::SincBestQuality, src_sample_rate, 16000, num_of_channels)?;
+
+        Ok(
+            Self {
+                inner,
+                sample_converter,
+                chunk_size,
+                delay,
+                prev: false,
+                silence_clock: Instant::now()
+            }
+        )
+    }
+
+    fn u8_to_f32_vec(v: &[u8]) -> Vec<f32> {
+        v.array_chunks::<4>()
+            .copied()
+            .map(f32::from_le_bytes)
+            .collect()
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn is_talking(&mut self, slice:& [u8]) -> bool {
+        let resampled = self.sample_converter.process(&Self::u8_to_f32_vec(slice)).unwrap();
+        let talking_status = self.inner.predict(resampled) > 0.75;
+
+        let prev_temp = self.prev;
+        
+        self.prev = talking_status;
+        if talking_status {
+            // stop timer
+            self.silence_clock = Instant::now();
+            return talking_status;
+        }
+        
+        // not talking
+
+        // but was talking 
+        if prev_temp {
+            self.silence_clock = Instant::now();
+        }
+        // was not talking 
+
+        self.silence_clock.elapsed().as_millis() as usize <= self.delay
+    }
 }
